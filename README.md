@@ -56,6 +56,15 @@ sliding-window heuristic (count of open n-in-a-row windows, weighted
 superlinearly by how many stones already occupy them) provides the leaf
 evaluation.
 
+The transposition table in `agent.py` persists across turns within a game
+(module-level, not re-created per `my_agent()` call), guarded by new-game
+detection (geometry change or a stone count that decreased) so a stale cache
+is never carried into an unrelated game. Kaggle reuses the same process for
+every turn, so this means later-game search benefits from every earlier
+turn's work rather than starting cold each time — the effect compounds
+particularly playing second, since the second player always has one fewer
+empty cell than the first at every point in the game.
+
 ## Design decisions and dead ends
 
 Worth documenting because they're where the actual engineering happened:
@@ -86,6 +95,21 @@ Worth documenting because they're where the actual engineering happened:
   the same bound as unrelated siblings. Fix: each root sibling is searched
   with a full `(-inf, +inf)` window. Root has at most 7 children, so the
   pruning loss is negligible; correctness isn't.
+
+## A note on win rate
+
+Standard 7x6 Connect-4 is a solved game (Allis 1988 / Allen 1989): the first
+player wins with perfect play. That means 100% win rate is only even
+theoretically possible playing first, against imperfect opponents, with a
+search deep enough to reach the game-theoretic optimum — this repo's
+`test_empty_board_center_wins_is_optimal` test checks that the engine finds
+the correct optimal first move, but the *submitted* agent runs a time-budgeted
+approximate search, not an exhaustive one, since a from-scratch full solve of
+the empty board takes minutes (see the opening-book section above). Playing
+second, no amount of search closes a fully solved gap against a perfect
+opponent; against the actual field of imperfect bots, the practical lever is
+converting the opponent's mistakes into wins as reliably as possible — which
+is what the cross-turn transposition table above is for.
 
 ## Correctness testing
 

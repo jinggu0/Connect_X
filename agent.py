@@ -23,8 +23,33 @@ from __future__ import annotations
 
 import time
 
+# ---- Cross-turn transposition table cache ----
+# Kaggle reuses the same submitted process for every turn of a game (the
+# submission is loaded once, not re-imported per move), so module-level state
+# survives between my_agent() calls within one game. A fresh TT every turn
+# was throwing away an entire turn's worth of search on every single call —
+# wasteful in general, but especially costly when playing second: the second
+# player always has one fewer empty cell than the first player at every point
+# in the game, so with TT continuity the search converges toward the
+# provably-optimal move faster than a from-scratch-every-turn search ever
+# could, narrowing (though not eliminating — see README's Connect-4 first-
+# player-win theorem note) the practical gap against an imperfect opponent.
+#
+# _TT_GAME_ID guards against carrying a stale TT into a NEW game (Kaggle can
+# reuse a process across multiple games in local/dev harnesses, and even in
+# a single competition run there is no guarantee every call belongs to the
+# same game). A TT keyed by (position + mask) is only valid for one fixed
+# (rows, cols, inarow) geometry and one specific move history, so any signal
+# that we've started over — fewer stones on the board than last call, or a
+# different board geometry — must invalidate the cache before use rather than
+# silently returning a plausible-looking but wrong cached score.
+_tt_cache: dict[int, tuple[int, int, int]] = {}
+_tt_last_moves = -1
+_tt_geometry: tuple[int, int, int] | None = None
+
 
 def my_agent(observation, configuration):
+    global _tt_last_moves, _tt_geometry
     rows = configuration.rows
     cols = configuration.columns
     inarow = configuration.inarow
@@ -97,7 +122,7 @@ def my_agent(observation, configuration):
                         score -= 1
         return score
 
-    tt: dict[int, tuple[int, int, int]] = {}  # key -> (depth_stored, score, flag)  flag: 0=exact,1=lower,2=upper
+    tt = _tt_cache  # key -> (depth_stored, score, flag)  flag: 0=exact,1=lower,2=upper — reset logic below, before this is used
 
     def negamax(position: int, mask: int, moves: int, alpha: int, beta: int, depth_left: int) -> int:
         if moves == max_cells:
@@ -151,7 +176,16 @@ def my_agent(observation, configuration):
             flag = 2
         elif best_score >= beta:
             flag = 1
-        tt[key] = (min(depth_left, max_cells - moves), best_score, flag)
+        # Cap the cross-turn cache size (see the module-level _tt_cache
+        # comment): it now survives across an entire game rather than being
+        # thrown away every turn, so an unbounded dict is a real memory risk
+        # over a full 42-ply game. Once over the cap, stop adding NEW entries
+        # for the rest of this search call rather than evicting existing ones
+        # — a full clear-and-restart would defeat the entire point of cross-
+        # turn reuse, and 5M entries is already far more than a single-move
+        # search realistically populates before its time budget runs out.
+        if len(tt) < 5_000_000:
+            tt[key] = (min(depth_left, max_cells - moves), best_score, flag)
         return best_score
 
     def solve_root(position: int, mask: int, moves: int, time_budget_s: float):
@@ -220,6 +254,24 @@ def my_agent(observation, configuration):
     # stones directly (no XOR juggling needed at this entry point — the XOR
     # trick in play() is only for advancing the state after a move).
     position = my_position
+
+    # New-game detection: invalidate the cross-turn TT cache if this call
+    # can't be a continuation of the same game we were last tracking. Two
+    # signals, either one is sufficient to force a reset:
+    #   1. Geometry changed (different rows/cols/inarow) — a stale TT keyed
+    #      by (position + mask) under one geometry is meaningless (and could
+    #      even alias) under another.
+    #   2. moves < _tt_last_moves — stone count can only increase within a
+    #      single game (Connect-X has no captures/removal), so a decrease
+    #      means we're looking at an earlier or unrelated game state.
+    # A false "same game" positive here is the dangerous direction (a stale
+    # TT entry could return a confidently wrong score with no way to detect
+    # it downstream), so both checks err toward resetting when in doubt.
+    geometry = (rows, cols, inarow)
+    if geometry != _tt_geometry or moves < _tt_last_moves:
+        tt.clear()
+    _tt_geometry = geometry
+    _tt_last_moves = moves
 
     # Leave headroom under Kaggle's ~ (configured) per-move limit + byoyomi;
     # 1.8s per iterative-deepening call is a conservative default that leaves
