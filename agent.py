@@ -86,7 +86,56 @@ def my_agent(observation, configuration):
         new_mask = mask | move
         return new_position, new_mask
 
-    def heuristic_score(position: int, mask: int) -> int:
+    # Zugzwang / column-parity theory (Victor Allis, "A Knowledge-Based
+    # Approach to Connect-Four", 1988 — the "Claimeven" rule): if a full
+    # 7x6 game were played out to completion with strict bottom-up column
+    # filling and no player ever skips a forced reply, every cell that is an
+    # EVEN distance from the bottom of its column (2nd, 4th, 6th stone in
+    # that column) is eventually claimed by whichever player is NOT first to
+    # move overall — i.e. by Player 2 when Player 1 opens the game — because
+    # Player 2 can always "pair up" with whatever odd-row stone Player 1 just
+    # played directly below an even cell, guaranteeing they place the even
+    # one. This is exactly what happened in the incident that motivated this
+    # fix: the opponent (P2) built a hanging diagonal threat whose only open
+    # cell was the 2nd-from-bottom (even) square of an otherwise-untouched
+    # column; because we (P1) had no other legal move by that point, we were
+    # forced to play the bottom (odd) cell of that column ourselves, handing
+    # P2 the even cell directly above it on their very next move — a textbook
+    # Claimeven loss.
+    #
+    # We approximate "is this threat cell claimable by parity" as: (row's
+    # distance from the bottom of its column, 1-indexed) is even. Which side
+    # that favors is fixed by the theory (always P2, never P1 or the current
+    # mover), so heuristic_score below checks which real player — P1 or P2,
+    # computed from the move count, not from "whose turn is it at this
+    # negamax node" which flips every ply — owns each threat before applying
+    # the parity bonus/penalty. This is a heuristic bias, not a full zugzwang
+    # search (proving a parity claim exactly requires reasoning about the
+    # whole board's column-pairing strategy, out of scope for a per-move
+    # evaluation), but it is enough to make the search avoid *creating or
+    # leaving open* an even-row threat for the opponent when equally good
+    # alternatives exist, and to steer away from being the one who is forced
+    # to fill the odd cell beneath one late in the game.
+    def bottom_distance_1indexed(row: int) -> int:
+        # Our bitboard convention has row 0 = bottom (see engine/bitboard.py),
+        # matching Kaggle's board only after the top-down conversion done
+        # below when reconstructing state — heuristic_score always receives
+        # rows in this bottom-up convention, so distance-from-bottom is just
+        # row + 1.
+        return row + 1
+
+    def heuristic_score(position: int, mask: int, moves: int) -> int:
+        # Whose actual turn (P1 or P2, in the real game's fixed seating — not
+        # just "the mover at this negamax node", which flips every ply and
+        # says nothing about which side is genuinely first-player) is it to
+        # play next, i.e. who does `position` belong to at this node? Move
+        # number (moves + 1), 1-indexed, is odd for P1's moves and even for
+        # P2's (P1 always plays move 1). This must be recomputed per node
+        # (not captured from the outer my_is_first_player, which only tells
+        # us whether *we* are P1) because heuristic_score is evaluated at
+        # arbitrary depths where the mover alternates every ply.
+        mover_is_p1 = ((moves + 1) % 2 == 1)
+        opp_is_p1 = not mover_is_p1
         opp = mask ^ position
         score = 0
         for c in range(cols):
@@ -98,6 +147,7 @@ def my_agent(observation, configuration):
                         continue
                     mine_ct = 0
                     theirs_ct = 0
+                    empty_cell = None
                     for k in range(inarow):
                         rr = r + dr * k
                         cc = c + dc * k
@@ -106,16 +156,46 @@ def my_agent(observation, configuration):
                             mine_ct += 1
                         elif opp & bit:
                             theirs_ct += 1
+                        else:
+                            empty_cell = (rr, cc)
                     if mine_ct > 0 and theirs_ct > 0:
                         continue
                     if mine_ct == inarow - 1:
                         score += 25
+                        # Symmetric Claimeven bonus: if OUR hanging threat's
+                        # empty cell is an even row and WE are P2, that cell
+                        # is ours by column-parity theory (see the penalty
+                        # branch below for the full explanation) — the flat
+                        # +25 undersells how strong this actually is.
+                        if empty_cell is not None and not mover_is_p1:
+                            er, ec = empty_cell
+                            if bottom_distance_1indexed(er) % 2 == 0:
+                                score += 60
                     elif mine_ct == 2:
                         score += 5
                     elif mine_ct == 1:
                         score += 1
                     elif theirs_ct == inarow - 1:
                         score -= 25
+                        # Claimeven parity check (Victor Allis 1988): if a
+                        # 7x6 game is played to completion with strict
+                        # bottom-up column filling, every cell an EVEN
+                        # distance from the bottom of its column is
+                        # eventually claimed by Player 2, because P2 can
+                        # always "pair up" underneath whatever odd-row stone
+                        # P1 just played. A hanging opponent (theirs) threat
+                        # whose one empty cell is even-row and belongs to P2
+                        # (opp_is_p1 is False, i.e. opp == P2) is therefore
+                        # not just "an open threat" but destined to fall to
+                        # them regardless of tactics — this is exactly the
+                        # pattern that caused the real loss this fix targets
+                        # (see README's parity-loss writeup). Steeply
+                        # penalize so search actively avoids being forced
+                        # into opening that column.
+                        if empty_cell is not None and not opp_is_p1:
+                            er, ec = empty_cell
+                            if bottom_distance_1indexed(er) % 2 == 0:
+                                score -= 60
                     elif theirs_ct == 2:
                         score -= 5
                     elif theirs_ct == 1:
@@ -139,7 +219,7 @@ def my_agent(observation, configuration):
                 return beta
 
         if depth_left <= 0:
-            return heuristic_score(position, mask)
+            return heuristic_score(position, mask, moves)
 
         key = position + mask
         entry = tt.get(key)

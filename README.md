@@ -96,6 +96,30 @@ Worth documenting because they're where the actual engineering happened:
   with a full `(-inf, +inf)` window. Root has at most 7 children, so the
   pruning loss is negligible; correctness isn't.
 
+- **A real loss, root-caused from a downloaded episode log, that had nothing
+  to do with search depth.** Analyzing a lost game (playing first) found the
+  opponent had built a hanging diagonal threat 22 plies before it was
+  completed — the one empty cell needed to finish it sat untouched in an
+  otherwise-empty column. The game's other six columns filled up over those
+  22 plies (neither side ever needed that column for anything else), and by
+  the time it was the *only* legal column left, playing its bottom cell
+  forced the second-from-bottom cell open directly above it — the opponent's
+  winning cell — on their very next move. No search depth fixes this: the
+  agent had zero alternative moves at that point, so no amount of lookahead
+  changes the outcome once the board narrows to one open column. The real
+  fix is upstream — recognizing *early* that a column containing an
+  opponent's hanging threat on an even-from-bottom cell will, by Connect-4's
+  Claimeven parity theorem (Allis 1988), eventually be forced open by
+  whichever player is *not* second, and steering the heuristic to avoid ever
+  being the one who has no better option than to fill it. `heuristic_score`
+  now checks, per detected 3-in-a-row-plus-one-gap threat, whether the gap
+  cell's distance from the bottom of its column is even, and whether the
+  side that owns the threat is genuinely Player 2 (computed from the move
+  count at that search node, not from "whose turn is it here" — that flips
+  every ply and says nothing about fixed seating) — applying a much steeper
+  penalty/bonus than an ordinary open threat when the theorem says the
+  outcome is not just likely but determined.
+
 ## A note on win rate
 
 Standard 7x6 Connect-4 is a solved game (Allis 1988 / Allen 1989): the first
